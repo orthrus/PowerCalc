@@ -34,6 +34,8 @@ namespace PowerCalc
             bool importedToday = false;
             decimal numberOfDaysWithoutImport = 0;
 
+            DateTimeOffset firstDayWithoutImport = DateTimeOffset.MaxValue, lastDayWithoutImport = DateTimeOffset.MinValue;
+
             foreach (var entry in entries.Values)
             {
                 // First charge battery using exported energy
@@ -96,6 +98,15 @@ namespace PowerCalc
                 {
                     if(!importedToday)
                     {
+                        if(currentDay.Date < firstDayWithoutImport)
+                        {
+                            firstDayWithoutImport = currentDay.Date;
+                        }
+                        if(currentDay.Date > lastDayWithoutImport)
+                        {
+                            lastDayWithoutImport = currentDay.Date;
+                        }
+
                         numberOfDaysWithoutImport++;
                     }
                     importedToday = false;
@@ -110,7 +121,7 @@ namespace PowerCalc
             Console.WriteLine($"           Import   Export   Generated   Battery   Self");
             Console.WriteLine($"Original:    {originalUsage.Import:0000}     {originalUsage.Export:0000}        {originalUsage.Generated:0000}             {(originalUsage.Generated - originalUsage.Export) * 100 / originalUsage.Generated:00.0}%");
             Console.WriteLine($"Simulated:   {simulatedUsage.Import:0000}     {simulatedUsage.Export:0000}        {simulatedUsage.Generated:0000}      {totalBatteryUsage:0000}   {(simulatedUsage.Generated - simulatedUsage.Export) * 100 / simulatedUsage.Generated:00.0}%");
-            Console.WriteLine($"Days without import from grid: {numberOfDaysWithoutImport}");
+            Console.WriteLine($"Days without import from grid: {numberOfDaysWithoutImport} (First {firstDayWithoutImport:yyyy-MM-dd}, Last {lastDayWithoutImport:yyyy-MM-dd})");
         }
 
         private static (decimal Import, decimal Export, decimal Generated, decimal Usage) GetUsage(Dictionary<DateTimeOffset, Entry> entries)
