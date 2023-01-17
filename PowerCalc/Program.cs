@@ -4,6 +4,19 @@ using System.Globalization;
 
 namespace PowerCalc
 {
+    /**
+     * 
+     * Export CSV from Home Assistant
+     * 
+        SELECT *
+        FROM "statistics"
+        WHERE start >= '2022-01-01 00:00:00' AND start <= '2023-01-01 00:00:00'
+        AND metadata_id IN (15,19,20,21,22)
+        ORDER BY start
+     *
+     */
+
+
     internal class Program
     {
         static void Main(string[] args)
