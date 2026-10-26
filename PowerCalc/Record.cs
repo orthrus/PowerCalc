@@ -10,7 +10,7 @@ namespace PowerCalc
 {
     public enum RecordType
     {
-        Generated = 16,
+        Generated = 246,
         ImportT1 = 19,
         ImportT2 = 20,
         ExportT1 = 21,
@@ -25,8 +25,8 @@ namespace PowerCalc
         //public DateTimeOffset Created { get; set; }
         [Index(2)]
         public RecordType MetadataID { get; set; }
-        [Index(3)]
-        public DateTimeOffset Start { get; set; }
+        //[Index(3)]
+        //public DateTimeOffset Start { get; set; }
         //[Index(4)]
         //public decimal? Mean { get; set; }
         //[Index(5)]
@@ -39,6 +39,13 @@ namespace PowerCalc
         //public decimal? State { get; set; }
         [Index(9)]
         public decimal Sum { get; set; }
+        //[Index(10)]
+        //public double? CreatedTs { get; set; }
+        [Index(11)]
+        public double StartTs { get; set; }
+
+        [Ignore]
+        public DateTimeOffset Start => DateTimeOffset.FromUnixTimeSeconds((long)StartTs);
     }
 
     [DebuggerDisplay("{Start} <{Import} >{Export} ^{Generated}")]

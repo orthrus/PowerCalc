@@ -6,13 +6,13 @@ namespace PowerCalc
 {
     /**
      * 
-     * Export CSV from Home Assistant
+     * Export CSV from Home Assistant (SQLite):
      * 
         SELECT *
         FROM "statistics"
-        WHERE start >= '2022-01-01 00:00:00' AND start <= '2023-01-01 00:00:00'
-        AND metadata_id IN (15,19,20,21,22)
-        ORDER BY start
+        WHERE start_ts >= unixepoch('2025-01-01 00:00:00') AND start_ts <= unixepoch('2026-01-01 00:00:00')
+        AND metadata_id IN (246,19,20,21,22)
+        ORDER BY start_ts
      *
      */
 
@@ -21,16 +21,31 @@ namespace PowerCalc
     {
         static void Main(string[] args)
         {
-            var entries = ParseFile();
+            var filePath = args.Length > 0 ? args[0] : "statistics-export.csv";
+            if (!File.Exists(filePath))
+            {
+                Console.Error.WriteLine($"Usage: PowerCalc <path-to-statistics-export.csv>");
+                Console.Error.WriteLine($"File not found: {filePath}");
+                return;
+            }
+
+            var entries = ParseFile(filePath);
 
             decimal batterySoC = 0;
-            decimal batteryCapacity = 5.0M;
+            decimal batteryCapacity = 8.0M;
+            decimal maxPowerPerHour = 3.0M; // 3 kW over 1 hour = 3 kWh max per entry
+            decimal chargeEfficiency = 0.90M;
+            decimal dischargeEfficiency = 0.90M;
+            decimal extraPvFactor = 0.00M; // +50% extra PV generation
+            decimal importPrice = 0.29M;
+            decimal exportPrice = 0.01M;
 
             var originalUsage = GetUsage(entries);
 
             decimal totalBatteryUsage = 0;
+            decimal totalConversionLoss = 0;
 
-            DateTimeOffset currentDay = new DateTimeOffset(2022, 1, 1, 0, 0, 0, TimeSpan.FromHours(1));
+            DateTimeOffset currentDay = new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.FromHours(1));
             bool importedToday = false;
             decimal numberOfDaysWithoutImport = 0;
 
@@ -38,54 +53,52 @@ namespace PowerCalc
 
             foreach (var entry in entries.Values)
             {
-                // First charge battery using exported energy
-                if (batterySoC < batteryCapacity)
+                // Simulate extra PV generation (+50%): first offset import within the same hour, then export the remainder
+                if (entry.Generated > 0 && extraPvFactor > 0)
                 {
-                    if (entry.Export > 0)
+                    var extraGenerated = entry.Generated * extraPvFactor;
+                    entry.Generated += extraGenerated;
+
+                    var directSelfUse = Math.Min(entry.Import, extraGenerated);
+                    entry.Import -= directSelfUse;
+                    entry.Export += extraGenerated - directSelfUse;
+                }
+
+                // First charge battery using exported energy (90% charging efficiency, max 3 kWh/h)
+                if (batterySoC < batteryCapacity && entry.Export > 0)
+                {
+                    var neededCharge = batteryCapacity - batterySoC;
+                    var maxExportUsed = Math.Min(neededCharge / chargeEfficiency, maxPowerPerHour);
+                    var exportUsed = Math.Min(entry.Export, maxExportUsed);
+                    var addCharge = exportUsed * chargeEfficiency;
+
+                    batterySoC += addCharge;
+                    entry.Export -= exportUsed;
+                    totalConversionLoss += exportUsed - addCharge;
+
+                    if (batterySoC >= batteryCapacity)
                     {
-                        var addCharge = batteryCapacity - batterySoC;
-                        addCharge = Math.Min(addCharge, entry.Export);
-
-                        batterySoC += addCharge;
-                        entry.Export -= addCharge;
-
-                        if (batterySoC == batteryCapacity)
-                        {
-                            Console.WriteLine($"Battery full at {entry.Start}");
-                        }
-                        else if (batterySoC > batteryCapacity)
-                        {
-
-                        }
+                        batterySoC = batteryCapacity;
+                        Console.WriteLine($"Battery full at {entry.Start}");
                     }
                 }
 
-                // Next remove charge from battery where possible
-                if (batterySoC > 0)
+                // Next remove charge from battery where possible (90% discharging efficiency, max 3 kWh/h)
+                if (batterySoC > 0 && entry.Import > 0)
                 {
-                    if (entry.Import <= batterySoC)
-                    {
-                        // Imported equal or less than battery SoC
-                        var removeCharge = entry.Import;
-                        batterySoC -= removeCharge;
-                        entry.Import -= removeCharge;
-                        totalBatteryUsage += removeCharge;
+                    var maxDeliverable = Math.Min(batterySoC * dischargeEfficiency, maxPowerPerHour);
+                    var delivered = Math.Min(entry.Import, maxDeliverable);
+                    var removeCharge = delivered / dischargeEfficiency;
 
-                        if (batterySoC == 0)
-                        {
-                            Console.WriteLine($"Battery empty at {entry.Start}");
-                        }
-                        else if (batterySoC < 0)
-                        {
+                    batterySoC -= removeCharge;
+                    entry.Import -= delivered;
+                    totalBatteryUsage += delivered;
+                    totalConversionLoss += removeCharge - delivered;
 
-                        }
-                    }
-                    else
+                    if (batterySoC <= 0)
                     {
-                        // Imported more than battery SoC, fully drain battery
-                        var removeCharge = batterySoC;
-                        entry.Import -= batterySoC;
                         batterySoC = 0;
+                        Console.WriteLine($"Battery empty at {entry.Start}");
                     }
                 }
 
@@ -117,10 +130,15 @@ namespace PowerCalc
 
             var simulatedUsage = GetUsage(entries);
 
+            var originalCost = (originalUsage.Import * importPrice) - (originalUsage.Export * exportPrice);
+            var simulatedCost = (simulatedUsage.Import * importPrice) - (simulatedUsage.Export * exportPrice);
+            var savings = originalCost - simulatedCost;
+
             Console.WriteLine("");
-            Console.WriteLine($"           Import   Export   Generated   Battery   Self");
-            Console.WriteLine($"Original:    {originalUsage.Import:0000}     {originalUsage.Export:0000}        {originalUsage.Generated:0000}             {(originalUsage.Generated - originalUsage.Export) * 100 / originalUsage.Generated:00.0}%");
-            Console.WriteLine($"Simulated:   {simulatedUsage.Import:0000}     {simulatedUsage.Export:0000}        {simulatedUsage.Generated:0000}      {totalBatteryUsage:0000}   {(simulatedUsage.Generated - simulatedUsage.Export) * 100 / simulatedUsage.Generated:00.0}%");
+            Console.WriteLine($"           Import   Export   Generated   Battery   Loss   Self     Cost");
+            Console.WriteLine($"Original:    {originalUsage.Import:0000}     {originalUsage.Export:0000}        {originalUsage.Generated:0000}                    {(originalUsage.Generated - originalUsage.Export) * 100 / originalUsage.Generated:00.0}%   {originalCost,7:0.00}");
+            Console.WriteLine($"Simulated:   {simulatedUsage.Import:0000}     {simulatedUsage.Export:0000}        {simulatedUsage.Generated:0000}      {totalBatteryUsage:0000}   {totalConversionLoss:0000}   {(simulatedUsage.Generated - simulatedUsage.Export) * 100 / simulatedUsage.Generated:00.0}%   {simulatedCost,7:0.00}");
+            Console.WriteLine($"Savings:                                                          {savings,7:0.00}");
             Console.WriteLine($"Days without import from grid: {numberOfDaysWithoutImport} (First {firstDayWithoutImport:yyyy-MM-dd}, Last {lastDayWithoutImport:yyyy-MM-dd})");
         }
 
@@ -139,7 +157,7 @@ namespace PowerCalc
             return (totalImport, totalExport, totalGenerated, (totalImport + totalGenerated - totalExport));
         }
 
-        private static Dictionary<DateTimeOffset, Entry> ParseFile()
+        private static Dictionary<DateTimeOffset, Entry> ParseFile(string filePath)
         {
             var config = new CsvConfiguration(CultureInfo.InvariantCulture)
             {
@@ -147,7 +165,7 @@ namespace PowerCalc
                 Delimiter = ",",
             };
 
-            using (var reader = new StreamReader("C:\\Temp\\statistics-export.csv"))
+            using (var reader = new StreamReader(filePath))
             using (var csv = new CsvReader(reader, config))
             {
 
