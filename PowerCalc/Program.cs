@@ -1,5 +1,6 @@
 ﻿using CsvHelper;
 using CsvHelper.Configuration;
+using System.CommandLine;
 using System.Globalization;
 
 namespace PowerCalc
@@ -19,35 +20,238 @@ namespace PowerCalc
 
     internal class Program
     {
-        static void Main(string[] args)
-        {
-            var filePath = args.Length > 0 ? args[0] : "statistics-export.csv";
-            if (!File.Exists(filePath))
-            {
-                Console.Error.WriteLine($"Usage: PowerCalc <path-to-statistics-export.csv>");
-                Console.Error.WriteLine($"File not found: {filePath}");
-                return;
-            }
+        private record SimulationResult(
+            decimal Capacity,
+            decimal Import,
+            decimal Export,
+            decimal Generated,
+            decimal BatteryUsage,
+            decimal ConversionLoss,
+            decimal IdleConsumption,
+            decimal SelfPercentage,
+            decimal Cost,
+            decimal Savings,
+            decimal DaysWithoutImport,
+            DateTimeOffset FirstDayWithoutImport,
+            DateTimeOffset LastDayWithoutImport);
 
-            var entries = ParseFile(filePath);
-            if (entries.Count == 0)
+        static int Main(string[] args)
+        {
+            var fileArgument = new Argument<string>("file")
             {
-                Console.Error.WriteLine($"No records found in {filePath}.");
-                return;
-            }
+                Description = "Path to the Home Assistant statistics export CSV file",
+                DefaultValueFactory = _ => "statistics-export.csv"
+            };
+
+            var capacityOption = new Option<decimal>("--capacity", "-c")
+            {
+                Description = "Usable battery capacity in kWh",
+                DefaultValueFactory = _ => 7.1M
+            };
+
+            var degradationOption = new Option<decimal>("--degradation", "-d")
+            {
+                Description = "Annual battery capacity degradation factor (e.g. 0.02 for 2%/year)",
+                DefaultValueFactory = _ => 0.02M
+            };
+
+            var maxPowerOption = new Option<decimal>("--max-power", "-p")
+            {
+                Description = "Max battery charge/discharge power in kW (kWh per hour)",
+                DefaultValueFactory = _ => 3.0M
+            };
+
+            var idleOption = new Option<decimal>("--idle", "-i")
+            {
+                Description = "Hourly BMS/inverter standby consumption in kWh",
+                DefaultValueFactory = _ => 0.020M
+            };
+
+            var chargeEffOption = new Option<decimal>("--charge-efficiency")
+            {
+                Description = "Battery charging efficiency factor (0-1)",
+                DefaultValueFactory = _ => 0.91M
+            };
+
+            var dischargeEffOption = new Option<decimal>("--discharge-efficiency")
+            {
+                Description = "Battery discharging efficiency factor (0-1)",
+                DefaultValueFactory = _ => 0.91M
+            };
+
+            var extraPvOption = new Option<decimal>("--extra-pv")
+            {
+                Description = "Extra PV generation factor (e.g. 0.50 for +50%)",
+                DefaultValueFactory = _ => 0.00M
+            };
+
+            var importPriceOption = new Option<decimal>("--import-price")
+            {
+                Description = "Grid import price per kWh",
+                DefaultValueFactory = _ => 0.29M
+            };
+
+            var exportPriceOption = new Option<decimal>("--export-price")
+            {
+                Description = "Grid export compensation per kWh",
+                DefaultValueFactory = _ => 0.01M
+            };
+
+            var tenYearOption = new Option<bool>("--10year", "--10years", "-10")
+            {
+                Description = "Run a 10-year simulation including annual battery degradation"
+            };
+
+            var yearsOption = new Option<int>("--years", "-y")
+            {
+                Description = "Number of years to simulate (overrides --10year when > 1)",
+                DefaultValueFactory = _ => 1
+            };
+
+            var rootCommand = new RootCommand("Home Assistant solar & home battery simulator")
+            {
+                fileArgument,
+                capacityOption,
+                degradationOption,
+                maxPowerOption,
+                idleOption,
+                chargeEffOption,
+                dischargeEffOption,
+                extraPvOption,
+                importPriceOption,
+                exportPriceOption,
+                tenYearOption,
+                yearsOption
+            };
+
+            rootCommand.SetAction(parseResult =>
+            {
+                var filePath = parseResult.GetValue(fileArgument);
+                var batteryCapacity = parseResult.GetValue(capacityOption);
+                var annualDegradation = parseResult.GetValue(degradationOption);
+                var maxPowerPerHour = parseResult.GetValue(maxPowerOption);
+                var idleConsumptionPerHour = parseResult.GetValue(idleOption);
+                var chargeEfficiency = parseResult.GetValue(chargeEffOption);
+                var dischargeEfficiency = parseResult.GetValue(dischargeEffOption);
+                var extraPvFactor = parseResult.GetValue(extraPvOption);
+                var importPrice = parseResult.GetValue(importPriceOption);
+                var exportPrice = parseResult.GetValue(exportPriceOption);
+                var run10Years = parseResult.GetValue(tenYearOption);
+                var years = parseResult.GetValue(yearsOption);
+
+                if (run10Years && years <= 1)
+                {
+                    years = 10;
+                }
+
+                if (!File.Exists(filePath))
+                {
+                    Console.Error.WriteLine($"File not found: {filePath}");
+                    return 1;
+                }
+
+                var entries = ParseFile(filePath);
+                if (entries.Count == 0)
+                {
+                    Console.Error.WriteLine($"No records found in {filePath}.");
+                    return 1;
+                }
+
+                var originalUsage = GetUsage(entries);
+                var originalCost = (originalUsage.Import * importPrice) - (originalUsage.Export * exportPrice);
+                var originalSelf = originalUsage.Generated > 0
+                    ? (originalUsage.Generated - originalUsage.Export) * 100 / originalUsage.Generated
+                    : 0;
+
+                if (years <= 1)
+                {
+                    var result = RunYearSimulation(
+                        entries,
+                        batteryCapacity,
+                        maxPowerPerHour,
+                        idleConsumptionPerHour,
+                        chargeEfficiency,
+                        dischargeEfficiency,
+                        extraPvFactor,
+                        importPrice,
+                        exportPrice,
+                        originalCost,
+                        verbose: true);
+
+                    Console.WriteLine("");
+                    Console.WriteLine($"           Import   Export   Generated   Battery   Loss   Idle   Self     Cost");
+                    Console.WriteLine($"Original:    {originalUsage.Import:0000}     {originalUsage.Export:0000}        {originalUsage.Generated:0000}                           {originalSelf:00.0}%   €{originalCost,7:0.00}");
+                    Console.WriteLine($"Simulated:   {result.Import:0000}     {result.Export:0000}        {result.Generated:0000}      {result.BatteryUsage:0000}   {result.ConversionLoss:0000}   {result.IdleConsumption:0000}   {result.SelfPercentage:00.0}%   €{result.Cost,7:0.00}");
+                    Console.WriteLine($"Savings:                                                                 €{result.Savings,7:0.00}");
+                    Console.WriteLine($"Days without import from grid: {result.DaysWithoutImport} (First {result.FirstDayWithoutImport:yyyy-MM-dd}, Last {result.LastDayWithoutImport:yyyy-MM-dd})");
+                }
+                else
+                {
+                    Console.WriteLine($"{years}-Year Simulation (Initial capacity: {batteryCapacity:0.00} kWh, Degradation: {annualDegradation * 100:0.0}%/year)");
+                    Console.WriteLine($"Original yearly baseline: Import {originalUsage.Import:0} kWh, Export {originalUsage.Export:0} kWh, Generated {originalUsage.Generated:0} kWh, Self {originalSelf:00.0}%, Cost €{originalCost:0.00}");
+                    Console.WriteLine("");
+                    Console.WriteLine($"Year   Cap(kWh)   Import   Export   Battery   Loss   Idle   Self    ZeroDays   Cost       Savings    Cumulative");
+
+                    decimal cumulativeSavings = 0;
+                    decimal totalMultiYearBattery = 0;
+
+                    for (int year = 1; year <= years; year++)
+                    {
+                        var effectiveCapacity = Math.Max(0, batteryCapacity * (1.0M - (annualDegradation * (year - 1))));
+                        var result = RunYearSimulation(
+                            entries,
+                            effectiveCapacity,
+                            maxPowerPerHour,
+                            idleConsumptionPerHour,
+                            chargeEfficiency,
+                            dischargeEfficiency,
+                            extraPvFactor,
+                            importPrice,
+                            exportPrice,
+                            originalCost,
+                            verbose: false);
+
+                        cumulativeSavings += result.Savings;
+                        totalMultiYearBattery += result.BatteryUsage;
+
+                        Console.WriteLine($"  {year,2}      {result.Capacity,5:0.00}     {result.Import:0000}     {result.Export:0000}      {result.BatteryUsage:0000}   {result.ConversionLoss:0000}   {result.IdleConsumption:0000}   {result.SelfPercentage:00.0}%        {result.DaysWithoutImport,3}   €{result.Cost,7:0.00}   €{result.Savings,7:0.00}     €{cumulativeSavings,8:0.00}");
+                    }
+
+                    Console.WriteLine("");
+                    Console.WriteLine($"Total {years}-year battery energy delivered: {totalMultiYearBattery:0} kWh");
+                    Console.WriteLine($"Total {years}-year savings:                  €{cumulativeSavings:0.00} (avg €{cumulativeSavings / years:0.00}/year)");
+                }
+
+                return 0;
+            });
+
+            return rootCommand.Parse(args).Invoke();
+        }
+
+        private static SimulationResult RunYearSimulation(
+            Dictionary<DateTimeOffset, Entry> sourceEntries,
+            decimal batteryCapacity,
+            decimal maxPowerPerHour,
+            decimal idleConsumptionPerHour,
+            decimal chargeEfficiency,
+            decimal dischargeEfficiency,
+            decimal extraPvFactor,
+            decimal importPrice,
+            decimal exportPrice,
+            decimal originalCost,
+            bool verbose)
+        {
+            var entries = sourceEntries.ToDictionary(
+                kvp => kvp.Key,
+                kvp => new Entry
+                {
+                    Start = kvp.Value.Start,
+                    Import = kvp.Value.Import,
+                    Export = kvp.Value.Export,
+                    Generated = kvp.Value.Generated,
+                });
 
             decimal batterySoC = 0;
-            decimal batteryCapacity = 7M;
-            decimal maxPowerPerHour = 3.0M; // 3 kW over 1 hour = 3 kWh max per entry
-            decimal idleConsumptionPerHour = 0.020M; // 20W BMS/inverter standby consumption (0.02 kWh/h)
-            decimal chargeEfficiency = 0.91M;
-            decimal dischargeEfficiency = 0.91M;
-            decimal extraPvFactor = 0.00M; // +50% extra PV generation
-            decimal importPrice = 0.29M;
-            decimal exportPrice = 0.01M;
-
-            var originalUsage = GetUsage(entries);
-
             decimal totalBatteryUsage = 0;
             decimal totalConversionLoss = 0;
             decimal totalIdleConsumption = 0;
@@ -129,7 +333,10 @@ namespace PowerCalc
                     if (batterySoC >= batteryCapacity)
                     {
                         batterySoC = batteryCapacity;
-                        Console.WriteLine($"Battery full at {entry.Start}");
+                        if (verbose)
+                        {
+                            Console.WriteLine($"Battery full at {entry.Start}");
+                        }
                     }
                 }
 
@@ -149,7 +356,10 @@ namespace PowerCalc
                     if (batterySoC <= 0)
                     {
                         batterySoC = 0;
-                        Console.WriteLine($"Battery empty at {entry.Start}");
+                        if (verbose)
+                        {
+                            Console.WriteLine($"Battery empty at {entry.Start}");
+                        }
                     }
                 }
 
@@ -169,7 +379,10 @@ namespace PowerCalc
                     if (batterySoC >= batteryCapacity)
                     {
                         batterySoC = batteryCapacity;
-                        Console.WriteLine($"Battery full at {entry.Start}");
+                        if (verbose)
+                        {
+                            Console.WriteLine($"Battery full at {entry.Start}");
+                        }
                     }
                 }
 
@@ -195,24 +408,26 @@ namespace PowerCalc
             }
 
             var simulatedUsage = GetUsage(entries);
-
-            var originalCost = (originalUsage.Import * importPrice) - (originalUsage.Export * exportPrice);
             var simulatedCost = (simulatedUsage.Import * importPrice) - (simulatedUsage.Export * exportPrice);
             var savings = originalCost - simulatedCost;
-
-            var originalSelf = originalUsage.Generated > 0
-                ? (originalUsage.Generated - originalUsage.Export) * 100 / originalUsage.Generated
-                : 0;
             var simulatedSelf = simulatedUsage.Generated > 0
                 ? (simulatedUsage.Generated - simulatedUsage.Export) * 100 / simulatedUsage.Generated
                 : 0;
 
-            Console.WriteLine("");
-            Console.WriteLine($"           Import   Export   Generated   Battery   Loss   Idle   Self     Cost");
-            Console.WriteLine($"Original:    {originalUsage.Import:0000}     {originalUsage.Export:0000}        {originalUsage.Generated:0000}                           {originalSelf:00.0}%   €{originalCost,7:0.00}");
-            Console.WriteLine($"Simulated:   {simulatedUsage.Import:0000}     {simulatedUsage.Export:0000}        {simulatedUsage.Generated:0000}      {totalBatteryUsage:0000}   {totalConversionLoss:0000}   {totalIdleConsumption:0000}   {simulatedSelf:00.0}%   €{simulatedCost,7:0.00}");
-            Console.WriteLine($"Savings:                                                                 €{savings,7:0.00}");
-            Console.WriteLine($"Days without import from grid: {numberOfDaysWithoutImport} (First {firstDayWithoutImport:yyyy-MM-dd}, Last {lastDayWithoutImport:yyyy-MM-dd})");
+            return new SimulationResult(
+                batteryCapacity,
+                simulatedUsage.Import,
+                simulatedUsage.Export,
+                simulatedUsage.Generated,
+                totalBatteryUsage,
+                totalConversionLoss,
+                totalIdleConsumption,
+                simulatedSelf,
+                simulatedCost,
+                savings,
+                numberOfDaysWithoutImport,
+                firstDayWithoutImport,
+                lastDayWithoutImport);
         }
 
         private static (decimal Import, decimal Export, decimal Generated, decimal Usage) GetUsage(Dictionary<DateTimeOffset, Entry> entries)
